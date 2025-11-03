@@ -1,0 +1,165 @@
+% Load dataset and show descriptive statistics
+data = readtable('Soft_Actuator_FEA_Dataset.csv');
+predictorNames = {'Pressure','Height','Length','Thickness'};
+X = data{:, predictorNames};
+y = data.Deformation;
+
+figure;
+histogram(y,25,'FaceAlpha',0.7,'FaceColor',[0.1 0.6 0.4]);
+xlabel('Deformation (mm)'); ylabel('Count');
+title('Distribution of Deformation Values'); grid on;
+
+% Train/test split and k-fold CV setup
+cvHold = cvpartition(size(X,1),'HoldOut',0.2);
+XTrain = X(cvHold.training,:); yTrain = y(cvHold.training);
+XTest  = X(cvHold.test,:);    yTest  = y(cvHold.test);
+XTrainTbl = array2table(XTrain, 'VariableNames', predictorNames);
+XTestTbl  = array2table(XTest, 'VariableNames', predictorNames);
+k = 5;
+
+% Random Forest and Gradient Boosting
+rfOpts = struct('Optimizer','bayesopt','ShowPlots',false, ...
+    'CVPartition',cvpartition(length(yTrain),'KFold',k), ...
+    'AcquisitionFunctionName','expected-improvement-plus', ...
+    'MaxObjectiveEvaluations',20);
+rfModel = fitrensemble(XTrainTbl, yTrain, 'Method','Bag', ...
+    'OptimizeHyperparameters',{'NumLearningCycles','MinLeafSize'}, ...
+    'HyperparameterOptimizationOptions',rfOpts);
+
+gbOpts = rfOpts;
+gbModel = fitrensemble(XTrainTbl, yTrain, 'Method','LSBoost', ...
+    'OptimizeHyperparameters',{'NumLearningCycles','LearnRate','MinLeafSize'}, ...
+    'HyperparameterOptimizationOptions',gbOpts);
+
+gprModel = fitrgp(XTrainTbl, yTrain, 'KernelFunction','squaredexponential', ...
+    'OptimizeHyperparameters','auto', ...
+    'HyperparameterOptimizationOptions',struct('ShowPlots',false,'KFold',k));
+
+% CV learning curves: error vs model complexity (num trees)
+learningCurveTrees = round(linspace(20,500,12));
+rfErrs = zeros(size(learningCurveTrees));
+gbErrs = zeros(size(learningCurveTrees));
+for i = 1:numel(learningCurveTrees)
+    tempRF = fitrensemble(XTrainTbl, yTrain, 'Method','Bag', ...
+        'NumLearningCycles', learningCurveTrees(i), 'PredictorNames', predictorNames);
+    cvRF = crossval(tempRF,'KFold',k); rfErrs(i) = sqrt(kfoldLoss(cvRF,'LossFun','mse'));
+    tempGB = fitrensemble(XTrainTbl, yTrain, 'Method','LSBoost', ...
+        'NumLearningCycles', learningCurveTrees(i), 'PredictorNames', predictorNames);
+    cvGB = crossval(tempGB,'KFold',k); gbErrs(i) = sqrt(kfoldLoss(cvGB,'LossFun','mse'));
+end
+figure;
+plot(learningCurveTrees, rfErrs, '-o','LineWidth',1.6); hold on;
+plot(learningCurveTrees, gbErrs, '-s','LineWidth',1.6);
+xlabel('Number of Trees'); ylabel('CV RMSE');
+title('Learning Curves: RF & GB (CV RMSE vs. Complexity)');
+legend('RF','GB'); grid on;
+
+% Test set predictions and metrics
+rfTestPred = predict(rfModel, XTestTbl);
+gbTestPred = predict(gbModel, XTestTbl);
+[gprTestPred, gprTestSD] = predict(gprModel, XTestTbl);
+
+rfTestRMSE = sqrt(mean((yTest - rfTestPred).^2));
+gbTestRMSE = sqrt(mean((yTest - gbTestPred).^2));
+gprTestRMSE = sqrt(mean((yTest - gprTestPred).^2));
+
+rfTestR2 = corr(yTest, rfTestPred)^2;
+gbTestR2 = corr(yTest, gbTestPred)^2;
+gprTestR2 = corr(yTest, gprTestPred)^2;
+
+% Parity plots 
+figure;
+scatter(yTest, rfTestPred, 40, 'filled'); hold on;
+scatter(yTest, gbTestPred, 40, 'filled');
+scatter(yTest, gprTestPred, 40, 'filled');
+plot([min(yTest),max(yTest)], [min(yTest),max(yTest)], 'k--', 'LineWidth',1.2);
+xlabel('Actual Deformation'); ylabel('Predicted Deformation');
+title('Parity Plot: Predicted vs Actual');
+legend(sprintf('RF (RMSE %.2f, R^2 %.3f)',rfTestRMSE,rfTestR2), ...
+       sprintf('GB (RMSE %.2f, R^2 %.3f)',gbTestRMSE,gbTestR2), ...
+       sprintf('GPR (RMSE %.2f, R^2 %.3f)',gprTestRMSE,gprTestR2),'Location','best'); grid on;
+
+% Residual plots and histograms
+rfRes = yTest - rfTestPred; gbRes = yTest - gbTestPred; gprRes = yTest - gprTestPred;
+figure;
+subplot(1,3,1); scatter(rfTestPred, rfRes, 25, 'filled'); xlabel('Predicted'); ylabel('Residual'); title('RF Residuals'); grid on;
+subplot(1,3,2); scatter(gbTestPred, gbRes, 25, 'filled'); xlabel('Predicted'); ylabel('Residual'); title('GB Residuals'); grid on;
+subplot(1,3,3); scatter(gprTestPred, gprRes, 25, 'filled'); xlabel('Predicted'); ylabel('Residual'); title('GPR Residuals'); grid on;
+figure;
+histogram(rfRes, 20, 'FaceAlpha',0.7); hold on;
+histogram(gbRes, 20, 'FaceAlpha',0.7); histogram(gprRes, 20, 'FaceAlpha',0.7);
+xlabel('Residual'); ylabel('Frequency'); legend('RF','GB','GPR'); title('Residual Distribution'); grid on;
+
+% Feature importance bar chart
+rfImportance = oobPermutedPredictorImportance(rfModel);
+gbImportance = predictorImportance(gbModel);
+figure;
+subplot(1,2,1); bar(rfImportance); set(gca,'XTickLabel',predictorNames); ylabel('Importance'); title('Random Forest Feature Importance'); grid on;
+subplot(1,2,2); bar(gbImportance); set(gca,'XTickLabel',predictorNames); ylabel('Importance'); title('GB Feature Importance'); grid on;
+
+% Partial dependence for top two important features 
+[~,impIdx] = sort(rfImportance, 'descend');
+top2 = impIdx(1:2);
+nPts = 50;
+figure;
+for i = 1:2
+    f = top2(i); values = linspace(min(XTrain(:,f)),max(XTrain(:,f)),nPts);
+    Xbase = repmat(mean(XTrain,1), nPts, 1);
+    Xbase(:,f) = values;
+    yhat = predict(rfModel, array2table(Xbase,'VariableNames',predictorNames));
+    subplot(1,2,i); plot(values, yhat, 'LineWidth',1.6);
+    xlabel(predictorNames{f}); ylabel('Predicted Deformation');
+    title(['PDP: ',predictorNames{f}]); grid on;
+end
+
+% GPR: predicted mean ± 2SD for test points (uncertainty)
+figure;
+errorbar(yTest, gprTestPred, 2*gprTestSD, 'o', 'MarkerFaceColor',[0.3 0.7 0.4]);
+hold on; plot([min(yTest),max(yTest)], [min(yTest),max(yTest)], 'k--');
+xlabel('Actual Deformation'); ylabel('Predicted ± 2SD');
+title('GPR Predictive Mean ± 2SD'); grid on;
+
+% Optional: 2D heatmap slice surrogate surface
+fixedIdx = setdiff(1:numel(predictorNames), top2);
+nGrid = 60;
+v1 = linspace(min(XTrain(:,top2(1))), max(XTrain(:,top2(1))), nGrid);
+v2 = linspace(min(XTrain(:,top2(2))), max(XTrain(:,top2(2))), nGrid);
+[VV1, VV2] = meshgrid(v1,v2);
+Z = zeros(nGrid,nGrid);
+fixedVals = mean(XTrain(:,fixedIdx),1);
+for i = 1:nGrid
+    for j = 1:nGrid
+        xrow = zeros(1,numel(predictorNames));
+        xrow(top2(1)) = VV1(i,j);
+        xrow(top2(2)) = VV2(i,j);
+        xrow(fixedIdx) = fixedVals;
+        Z(i,j) = predict(rfModel, array2table(xrow,'VariableNames',predictorNames));
+    end
+end
+figure;
+imagesc(v1, v2, Z); set(gca,'YDir','normal'); colorbar;
+xlabel(predictorNames{top2(1)}); ylabel(predictorNames{top2(2)});
+title(['RF Surrogate: Deformation (fixed [', predictorNames{fixedIdx(1)}, ',' , predictorNames{fixedIdx(2)}, ']=mean)']); axis tight;
+
+% Save models & results (optional)
+save('mlresults.mat','rfModel','gbModel','gprModel','rfImportance','gbImportance');
+
+% Test case predictions as specified...
+testCases = array2table([1250 5.25 55 1.05; 5000 8.00 100 1.20], 'VariableNames', predictorNames);
+caseLabels = {'Interpolative','Edge'};
+rfPred = predict(rfModel, testCases);
+gbPred = predict(gbModel, testCases);
+[gprPred, gprSD] = predict(gprModel, testCases);
+for i = 1:height(testCases)
+    fprintf('\n--- %s ---\n',caseLabels{i});
+    fprintf('Input: Pressure=%.1f, Height=%.2f, Length=%.1f, Thickness=%.2f\n', ...
+        testCases.Pressure(i), testCases.Height(i), testCases.Length(i), testCases.Thickness(i));
+    fprintf('RF pred: %.4f mm\n', rfPred(i));
+    fprintf('GB pred: %.4f mm\n', gbPred(i));
+    fprintf('GPR pred: %.4f ± %.4f mm (2×SD)\n', gprPred(i), 2*gprSD(i));
+    if gprSD(i) > 0.05*mean(yTrain)
+        fprintf('High uncertainty detected: recommend FEA validation.\n');
+    else
+        fprintf('Low uncertainty: prediction considered reliable.\n');
+    end
+end
